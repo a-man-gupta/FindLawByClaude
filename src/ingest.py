@@ -16,7 +16,8 @@ CHROMA_PATH = "./chroma_db"
 COLLECTION_NAME = "law_opinions"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
-COURTLISTENER_BASE = "https://www.courtlistener.com/api/rest/v4/opinions/"
+COURTLISTENER_SEARCH = "https://www.courtlistener.com/api/rest/v4/search/"
+COURTLISTENER_OPINIONS = "https://www.courtlistener.com/api/rest/v4/opinions/"
 
 SEED_QUERIES = [
     "contract breach",
@@ -217,35 +218,42 @@ async def fetch_oyez_cases(max_docs: int = 200) -> list[dict[str, Any]]:
     return docs
 
 
-# ── Source: CourtListener (requires free token) ───────────────────────────────
+# ── Source: CourtListener search (no auth needed) ────────────────────────────
 
 async def fetch_courtlistener(query: str, num_results: int = 50) -> list[dict[str, Any]]:
+    """Uses the /search/ endpoint which requires no authentication."""
+    params = {"q": query, "type": "o", "format": "json", "page_size": min(num_results, 100)}
     token = os.environ.get("COURTLISTENER_TOKEN")
-    if not token:
-        raise ValueError("COURTLISTENER_TOKEN not set")
-
-    headers = {"Authorization": f"Token {token}"}
-    params = {"format": "json", "search": query, "page_size": num_results}
+    headers = {"Authorization": f"Token {token}"} if token else {}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(COURTLISTENER_BASE, params=params, headers=headers)
+        response = await client.get(COURTLISTENER_SEARCH, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
 
     docs = []
     for item in data.get("results", []):
-        raw_text = item.get("plain_text") or item.get("html") or ""
-        text = re.sub(r"<[^>]+>", " ", raw_text).strip()
-        text = re.sub(r"\s+", " ", text)
-        if not text:
+        # Gather all available text: snippet + syllabus + procedural_history
+        parts = []
+        for opinion in item.get("opinions", []):
+            snippet = opinion.get("snippet", "")
+            if snippet:
+                parts.append(re.sub(r"<[^>]+>", " ", snippet))
+        for field in ("syllabus", "procedural_history", "posture"):
+            val = item.get(field) or ""
+            if val:
+                parts.append(re.sub(r"<[^>]+>", " ", val))
+
+        text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        if len(text) < 50:
             continue
-        cluster = item.get("cluster") or {}
+
         docs.append(
             {
-                "id": f"cl_{item.get('id', '')}",
-                "case_name": item.get("case_name") or cluster.get("case_name", "Unknown"),
-                "court": cluster.get("court", "Unknown") if isinstance(cluster, dict) else "Unknown",
-                "date_filed": item.get("date_filed") or item.get("date_created", ""),
+                "id": f"cl_{item.get('cluster_id', '')}",
+                "case_name": item.get("caseName") or item.get("caseNameFull", "Unknown"),
+                "court": item.get("court_citation_string") or item.get("court", "Unknown"),
+                "date_filed": item.get("dateFiled", ""),
                 "text": text,
                 "source_url": f"https://www.courtlistener.com{item.get('absolute_url', '')}",
             }
@@ -328,16 +336,30 @@ async def run_ingestion(queries: list[str] | None = None) -> AsyncIterator[dict[
     total_chunks = 0
     has_cl = bool(os.environ.get("COURTLISTENER_TOKEN"))
 
+    total_steps = len(queries) + 2  # +2 for Oyez + HuggingFace bulk steps
     yield {
         "event": "start",
-        "total_queries": len(queries) + 1,  # +1 for bulk HF step
-        "sources": {"courtlistener": has_cl, "huggingface": True},
+        "total_queries": total_steps,
+        "sources": {"courtlistener": True, "oyez": True, "huggingface": True},
     }
 
-    # Step 1: bulk ingest from HuggingFace (no auth)
-    yield {"event": "query_start", "query": "HuggingFace legal corpus", "index": 0, "total": len(queries) + 1}
+    loop = asyncio.get_event_loop()
+
+    # Step 1: Oyez SCOTUS cases (free, no auth)
+    yield {"event": "query_start", "query": "Oyez SCOTUS (2015–2023)", "index": 0, "total": total_steps}
     try:
-        loop = asyncio.get_event_loop()
+        oyez_docs = await fetch_oyez_cases(max_docs=200)
+        yield {"event": "fetched", "query": "Oyez SCOTUS", "docs": len(oyez_docs), "source": "Oyez"}
+        if oyez_docs:
+            chunks = await loop.run_in_executor(None, ingest_to_chroma, oyez_docs)
+            total_chunks += chunks
+            yield {"event": "ingested", "query": "Oyez SCOTUS", "chunks": chunks, "total_chunks": total_chunks}
+    except Exception as e:
+        yield {"event": "error", "query": "Oyez SCOTUS", "detail": str(e)}
+
+    # Step 2: HuggingFace legal corpus (free, no auth)
+    yield {"event": "query_start", "query": "HuggingFace legal corpus", "index": 1, "total": total_steps}
+    try:
         hf_docs = await loop.run_in_executor(None, fetch_hf_legal_cases, 500)
         yield {"event": "fetched", "query": "HuggingFace legal corpus", "docs": len(hf_docs), "source": "HuggingFace"}
         if hf_docs:
@@ -347,27 +369,25 @@ async def run_ingestion(queries: list[str] | None = None) -> AsyncIterator[dict[
     except Exception as e:
         yield {"event": "error", "query": "HuggingFace legal corpus", "detail": str(e)}
 
-    # Step 2: per-query ingestion (CourtListener if available, else skip)
+    # Step 3: per-query via CourtListener (if token provided)
     for i, query in enumerate(queries):
-        yield {"event": "query_start", "query": query, "index": i + 1, "total": len(queries) + 1}
+        yield {"event": "query_start", "query": query, "index": i + 2, "total": total_steps}
         docs: list[dict] = []
 
-        if has_cl:
-            try:
-                docs = await fetch_courtlistener(query, num_results=50)
-                yield {"event": "fetched", "query": query, "docs": len(docs), "source": "CourtListener"}
-            except Exception as e:
-                yield {"event": "warning", "query": query, "detail": str(e)}
+        try:
+            docs = await fetch_courtlistener(query, num_results=50)
+            yield {"event": "fetched", "query": query, "docs": len(docs), "source": "CourtListener"}
+        except Exception as e:
+            yield {"event": "warning", "query": query, "detail": str(e)}
 
         if docs:
-            loop = asyncio.get_event_loop()
             chunks = await loop.run_in_executor(None, ingest_to_chroma, docs)
             total_chunks += chunks
             yield {"event": "ingested", "query": query, "chunks": chunks, "total_chunks": total_chunks}
         else:
-            yield {"event": "skipped", "query": query, "detail": "No CourtListener token — add COURTLISTENER_TOKEN to .env for more data"}
+            yield {"event": "error", "query": query, "detail": "No results returned"}
 
-    yield {"event": "complete", "total_chunks": total_chunks, "total_queries": len(queries) + 1}
+    yield {"event": "complete", "total_chunks": total_chunks, "total_queries": total_steps}
 
 
 async def main() -> None:
