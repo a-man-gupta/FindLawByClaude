@@ -155,12 +155,13 @@ async def ask(request: AskRequest) -> AskResponse:
                     continue
 
                 try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
+                    parsed = json.loads(tool_call.function.arguments or "{}")
+                    args = parsed if isinstance(parsed, dict) else {}
+                except (json.JSONDecodeError, TypeError):
                     args = {}
 
-                query = args.get("query", request.question)
-                n_results = args.get("n_results", 5)
+                query = args.get("query") or request.question
+                n_results = args.get("n_results") or 5
 
                 try:
                     results = retrieve(query=query, n_results=n_results)
