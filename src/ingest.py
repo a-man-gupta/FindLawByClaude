@@ -112,6 +112,85 @@ def fetch_hf_legal_cases(max_docs: int = 500) -> list[dict[str, Any]]:
     return docs
 
 
+def fetch_cap_scotus(max_docs: int = 30000) -> list[dict[str, Any]]:
+    """Stream SCOTUS cases from Harvard Caselaw Access Project via HuggingFace.
+
+    free-law/Caselaw_Access_Project contains ~6.7M US cases.
+    We filter to SCOTUS only (~30k cases). No API key needed.
+    Resumable — pass max_docs to limit for testing.
+    """
+    from datasets import load_dataset  # type: ignore[import]
+
+    SCOTUS_SLUGS = {"scotus", "us"}
+
+    def extract_text(case: dict) -> str:
+        casebody = case.get("casebody")
+        if isinstance(casebody, dict):
+            data = casebody.get("data") or casebody
+            if isinstance(data, dict):
+                text = ""
+                for op in data.get("opinions", []):
+                    if isinstance(op, dict):
+                        text += op.get("text", "") + "\n\n"
+                text += data.get("head_matter", "")
+                return text.strip()
+            elif isinstance(data, str):
+                return data.strip()
+        elif isinstance(casebody, str):
+            return casebody.strip()
+        return ""
+
+    ds = load_dataset(
+        "free-law/Caselaw_Access_Project",
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
+    )
+
+    docs = []
+    for case in ds:
+        if len(docs) >= max_docs:
+            break
+
+        court = case.get("court") or {}
+        court_slug = court.get("slug", "") if isinstance(court, dict) else ""
+        court_name = court.get("name", "") if isinstance(court, dict) else str(court)
+        is_scotus = (
+            court_slug in SCOTUS_SLUGS
+            or "supreme court of the united states" in court_name.lower()
+        )
+        if not is_scotus:
+            continue
+
+        text = extract_text(case)
+        if not text or len(text) < 100:
+            text = case.get("name_abbreviation") or case.get("name", "")
+        if not text:
+            continue
+
+        cites = case.get("citations") or []
+        citation = ""
+        if cites:
+            first = cites[0]
+            citation = first.get("cite", "") if isinstance(first, dict) else str(first)
+
+        juris = case.get("jurisdiction") or {}
+        juris_slug = juris.get("slug", "") if isinstance(juris, dict) else str(juris)
+
+        docs.append(
+            {
+                "id": f"cap_{case.get('id', hashlib.md5(text[:60].encode()).hexdigest()[:10])}",
+                "case_name": case.get("name_abbreviation") or case.get("name", "Unknown"),
+                "court": court_name or "U.S. Supreme Court",
+                "date_filed": str(case.get("decision_date", "")),
+                "text": text[:8000],
+                "source_url": case.get("url", f"https://cite.case.law/{citation.replace(' ', '/')}" if citation else ""),
+            }
+        )
+
+    return docs
+
+
 def fetch_hf_us_opinions(topic: str, max_docs: int = 100) -> list[dict[str, Any]]:
     """
     Streams MultiLegalPile (English US legal text subset), keyword-filtered.
@@ -469,11 +548,119 @@ async def main() -> None:
             if bar:
                 bar.close()
             print(f"\nDone. Total chunks: {event['total_chunks']}")
-            print("\nTo add more data:")
-            print("  1. Register free at courtlistener.com → add COURTLISTENER_TOKEN to .env")
-            print("  2. Register free at case.law → add CAP_TOKEN to .env")
-            print("  3. Run python src/ingest.py again")
+            print("\nFor the full ~30k SCOTUS corpus run:  python src/ingest.py --scotus")
+
+
+async def main_scotus(max_docs: int = 30000) -> None:
+    """Ingest Harvard CAP SCOTUS corpus (~30k cases, 1–3 hours on CPU)."""
+    try:
+        from tqdm import tqdm
+        has_tqdm = True
+    except ImportError:
+        has_tqdm = False
+
+    print("Harvard CAP SCOTUS ingestion")
+    print(f"Target: up to {max_docs:,} cases  •  streaming from HuggingFace\n")
+
+    bar = tqdm(unit=" cases", desc="SCOTUS") if has_tqdm else None
+    loop = asyncio.get_event_loop()
+
+    def _run() -> list[dict]:
+        docs = []
+        from datasets import load_dataset  # type: ignore[import]
+        SCOTUS_SLUGS = {"scotus", "us"}
+
+        def extract_text(case: dict) -> str:
+            casebody = case.get("casebody")
+            if isinstance(casebody, dict):
+                data = casebody.get("data") or casebody
+                if isinstance(data, dict):
+                    t = ""
+                    for op in data.get("opinions", []):
+                        if isinstance(op, dict):
+                            t += op.get("text", "") + "\n\n"
+                    t += data.get("head_matter", "")
+                    return t.strip()
+                elif isinstance(data, str):
+                    return data.strip()
+            elif isinstance(casebody, str):
+                return casebody.strip()
+            return ""
+
+        ds = load_dataset("free-law/Caselaw_Access_Project", split="train",
+                          streaming=True, trust_remote_code=True)
+
+        pending: list[dict] = []
+        total_chunks = 0
+        scotus_count = 0
+
+        for case in ds:
+            if len(docs) >= max_docs:
+                break
+            court = case.get("court") or {}
+            slug = court.get("slug", "") if isinstance(court, dict) else ""
+            name_ = court.get("name", "") if isinstance(court, dict) else str(court)
+            if slug not in SCOTUS_SLUGS and "supreme court of the united states" not in name_.lower():
+                if bar:
+                    bar.update(1)
+                continue
+
+            text = extract_text(case)
+            if not text or len(text) < 100:
+                text = case.get("name_abbreviation") or case.get("name", "")
+            if not text:
+                if bar:
+                    bar.update(1)
+                continue
+
+            cites = case.get("citations") or []
+            citation = (cites[0].get("cite", "") if isinstance(cites[0], dict) else str(cites[0])) if cites else ""
+
+            docs.append({
+                "id": f"cap_{case.get('id', hashlib.md5(text[:60].encode()).hexdigest()[:10])}",
+                "case_name": case.get("name_abbreviation") or case.get("name", "Unknown"),
+                "court": name_ or "U.S. Supreme Court",
+                "date_filed": str(case.get("decision_date", "")),
+                "text": text[:8000],
+                "source_url": case.get("url", ""),
+            })
+            scotus_count += 1
+
+            # Ingest in batches of 200 to avoid huge memory use
+            if len(docs) % 200 == 0:
+                added = ingest_to_chroma(docs[-200:])
+                total_chunks += added
+                if bar:
+                    bar.set_postfix(scotus=scotus_count, chunks=total_chunks)
+
+            if bar:
+                bar.update(1)
+
+        # Flush remainder
+        remainder = len(docs) % 200
+        if remainder:
+            added = ingest_to_chroma(docs[-remainder:])
+            total_chunks += added
+
+        if bar:
+            bar.close()
+        print(f"\nDone. {scotus_count:,} SCOTUS cases → {total_chunks:,} total chunks in DB.")
+        return docs
+
+    await loop.run_in_executor(None, _run)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if "--scotus" in sys.argv:
+        # Optional: --max N to limit for testing e.g. --max 500
+        max_n = 30000
+        if "--max" in sys.argv:
+            idx = sys.argv.index("--max")
+            try:
+                max_n = int(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                pass
+        asyncio.run(main_scotus(max_docs=max_n))
+    else:
+        asyncio.run(main())
