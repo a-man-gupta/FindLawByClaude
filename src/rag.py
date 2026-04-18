@@ -29,15 +29,24 @@ def get_collection() -> chromadb.Collection:
 
 
 def retrieve(query: str, n_results: int = 5) -> list[dict[str, Any]]:
+    global _collection
     embedder = get_embedder()
-    collection = get_collection()
-
     query_embedding = embedder.encode(query).tolist()
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
-    )
+
+    def _query(coll: chromadb.Collection) -> dict:
+        return coll.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"],
+        )
+
+    try:
+        results = _query(get_collection())
+    except Exception:
+        # Cached collection may have a stale HNSW reader if data was written
+        # to disk after the handle was opened. Drop the cache and reopen.
+        _collection = None
+        results = _query(get_collection())
 
     output = []
     documents = results.get("documents", [[]])[0]
