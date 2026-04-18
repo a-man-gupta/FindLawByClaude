@@ -2,15 +2,15 @@ import asyncio
 import json
 import os
 
-import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from openai import OpenAI
 from pydantic import BaseModel
 
 from .ingest import SEED_QUERIES, get_db_stats, run_ingestion
-from .rag import SEARCH_LEGAL_DATABASE_TOOL, retrieve
+from .rag import OPENAI_TOOL_SPEC, retrieve
 
 load_dotenv()
 
@@ -23,7 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = "claude-sonnet-4-6"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MODEL = "anthropic/claude-haiku-4-5"  # OpenRouter model ID
 MAX_TOKENS = 4096
 SYSTEM_PROMPT = (
     "You are FindLawByClaude, an AI legal research assistant. "
@@ -58,7 +59,14 @@ class IngestRequest(BaseModel):
     queries: list[str] | None = None
 
 
-def _build_tool_result_content(results: list[dict]) -> str:
+def _get_client() -> OpenAI:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not configured")
+    return OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+
+
+def _build_tool_result(results: list[dict]) -> str:
     if not results:
         return "No relevant cases found in the database."
     parts = []
@@ -76,31 +84,38 @@ def _build_tool_result_content(results: list[dict]) -> str:
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest) -> AskResponse:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
-    client = anthropic.Anthropic(api_key=api_key)
-    messages: list[dict] = [{"role": "user", "content": request.question}]
+    client = _get_client()
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": request.question},
+    ]
     collected_sources: list[Source] = []
 
     while True:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=[SEARCH_LEGAL_DATABASE_TOOL],
+            tools=[OPENAI_TOOL_SPEC],
+            tool_choice="auto",
             messages=messages,
         )
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use" or block.name != "search_legal_database":
+        choice = response.choices[0]
+        msg = choice.message
+        messages.append(msg.model_dump(exclude_none=True))
+
+        if choice.finish_reason == "tool_calls" and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                if tool_call.function.name != "search_legal_database":
                     continue
 
-                query = block.input.get("query", request.question)
-                n_results = block.input.get("n_results", 5)
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+
+                query = args.get("query", request.question)
+                n_results = args.get("n_results", 5)
 
                 try:
                     results = retrieve(query=query, n_results=n_results)
@@ -119,22 +134,18 @@ async def ask(request: AskRequest) -> AskResponse:
                     if not any(s.source_url == source.source_url for s in collected_sources):
                         collected_sources.append(source)
 
-                tool_results.append(
+                messages.append(
                     {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": _build_tool_result_content(results),
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": _build_tool_result(results),
                     }
                 )
-
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-
         else:
-            answer_text = "".join(
-                block.text for block in response.content if hasattr(block, "text")
+            return AskResponse(
+                answer=msg.content or "",
+                sources=collected_sources,
             )
-            return AskResponse(answer=answer_text, sources=collected_sources)
 
 
 @app.post("/ingest")

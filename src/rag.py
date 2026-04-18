@@ -50,26 +50,29 @@ def retrieve(query: str, n_results: int = 5) -> list[dict[str, Any]]:
     return output
 
 
-SEARCH_LEGAL_DATABASE_TOOL = {
-    "name": "search_legal_database",
-    "description": (
-        "Search the local vector database of legal opinions from CourtListener. "
-        "Use this to retrieve relevant case law, precedents, and legal text that "
-        "can inform answers to legal questions."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query describing the legal topic or question.",
+OPENAI_TOOL_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "search_legal_database",
+        "description": (
+            "Search the local vector database of legal opinions from CourtListener. "
+            "Use this to retrieve relevant case law, precedents, and legal text that "
+            "can inform answers to legal questions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query describing the legal topic or question.",
+                },
+                "n_results": {
+                    "type": "integer",
+                    "description": "Number of results to return. Defaults to 5.",
+                    "default": 5,
+                },
             },
-            "n_results": {
-                "type": "integer",
-                "description": "Number of results to return. Defaults to 5.",
-                "default": 5,
-            },
+            "required": ["query"],
         },
-        "required": ["query"],
     },
 }

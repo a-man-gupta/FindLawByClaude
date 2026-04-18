@@ -9,29 +9,34 @@ Hackathon project built at Carnegie Mellon University (Claude Builder Club x CMU
 FindLawByClaude — help users discover, understand, and interact with legal information in a way that is accessible, meaningful, and empowering. (Update this as the project vision crystallizes.)
 
 ## Development Conventions
-- Language/stack: TBD — update this section when decided
 - No unnecessary comments; let code speak for itself
 - Keep responses terse and direct
 - Prefer editing existing files over creating new ones
 
-## Key Commands
-- Add build/test/run commands here as the project grows
-
 ## Stack
 - Python 3.11+
+- OpenRouter API (OpenAI-compatible) → `anthropic/claude-haiku-4-5`
 - ChromaDB (local vector DB at ./chroma_db)
 - sentence-transformers (all-MiniLM-L6-v2 embeddings)
-- Anthropic SDK (claude-sonnet-4-6 with tool use)
 - FastAPI + uvicorn
+- openai Python SDK (pointed at OpenRouter)
 
 ## Running
-1. cp .env.example .env && fill in ANTHROPIC_API_KEY
-2. pip install -r requirements.txt
-3. python src/ingest.py   # populate the vector DB
-4. uvicorn src.api:app --reload  # start API
-5. open frontend/index.html
+1. `cp .env.example .env` → fill in `OPENROUTER_API_KEY`
+2. `pip install -r requirements.txt`
+3. `python src/ingest.py`        # populate the vector DB (shows tqdm progress)
+4. `uvicorn src.api:app --reload` # start API on :8000
+5. `open frontend/index.html`    # or serve with any static file server
 
-## Claude API Usage
-- Use `claude-sonnet-4-6` (current model) or `claude-opus-4-7` for complex tasks
-- Enable prompt caching wherever possible
-- See: Anthropic SDK docs for tool use, streaming, and batch patterns
+## API Endpoints
+- `POST /ask` — `{question}` → `{answer, sources[]}`
+- `POST /ingest` — SSE stream of ingestion progress events
+- `GET  /ingest/status` — `{running: bool}`
+- `GET  /stats` — `{total_chunks: int}`
+- `GET  /health`
+
+## Key Files
+- `src/ingest.py` — CourtListener fetch + ChromaDB upsert + CLI with tqdm
+- `src/rag.py` — embedding + retrieval + OpenAI tool spec
+- `src/api.py` — FastAPI routes, OpenRouter tool-use loop
+- `frontend/index.html` — chat UI + live ingest panel
