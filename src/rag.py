@@ -33,10 +33,14 @@ def retrieve(query: str, n_results: int = 5) -> list[dict[str, Any]]:
     embedder = get_embedder()
     query_embedding = embedder.encode(query).tolist()
 
+    # Over-fetch so the lex_glue placeholder filter below has room to drop
+    # noise without starving the caller.
+    fetch_count = max(n_results * 4, 20)
+
     def _query(coll: chromadb.Collection) -> dict:
         return coll.query(
             query_embeddings=[query_embedding],
-            n_results=n_results,
+            n_results=fetch_count,
             include=["documents", "metadatas", "distances"],
         )
 
@@ -54,7 +58,15 @@ def retrieve(query: str, n_results: int = 5) -> list[dict[str, Any]]:
     distances = results.get("distances", [[]])[0]
 
     for doc, meta, dist in zip(documents, metadatas, distances):
+        # Drop HF lex_glue placeholder docs — they have no real case name or URL,
+        # so they pollute citations and source cards. Pattern: "SCOTUS Opinion (...)"
+        case_name = (meta or {}).get("case_name", "") or ""
+        source_url = (meta or {}).get("source_url", "") or ""
+        if case_name.startswith("SCOTUS Opinion (") and not source_url:
+            continue
         output.append({"text": doc, "metadata": meta, "distance": dist})
+        if len(output) >= n_results:
+            break
 
     return output
 
