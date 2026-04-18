@@ -24,8 +24,11 @@ app.add_middleware(
 )
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "anthropic/claude-haiku-4-5"  # OpenRouter model ID
+MODEL = "anthropic/claude-haiku-4-5"          # fast chat
+MODEL_DEEP = "anthropic/claude-opus-4-7"       # deep IRAC analysis with extended thinking
 MAX_TOKENS = 4096
+THINKING_BUDGET = 2500
+
 SYSTEM_PROMPT = (
     "You are FindLawByClaude, an AI legal research assistant. "
     "You have access to a database of real US court opinions. "
@@ -33,6 +36,19 @@ SYSTEM_PROMPT = (
     "Cite specific cases by name when they are relevant. "
     "Format your response with clear sections using markdown: bold key terms, use bullet points for lists of factors or elements. "
     "Be clear that you are not providing legal advice and users should consult a licensed attorney for their specific situation."
+)
+
+SYSTEM_PROMPT_DEEP = (
+    "You are FindLawByClaude in Deep Analysis mode — a senior legal research assistant. "
+    "You have been provided with relevant case law retrieved from a database of US court opinions. "
+    "Perform a rigorous IRAC analysis:\n"
+    "  - **Issue**: What legal question is at stake?\n"
+    "  - **Rule**: What binding precedent or legal principle applies? Cite cases by name.\n"
+    "  - **Application**: How does the rule map to the fact pattern? Address evidence cutting both ways.\n"
+    "  - **Conclusion**: What is the most likely legal outcome, and with what confidence?\n\n"
+    "Use markdown headers (## Issue, ## Rule, ## Application, ## Conclusion). "
+    "Identify counterarguments and ambiguities — do not oversimplify. "
+    "End with a brief disclaimer that this is not legal advice."
 )
 
 _ingest_lock = asyncio.Lock()
@@ -57,6 +73,17 @@ class AskResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     queries: list[str] | None = None
+
+
+class DeepRequest(BaseModel):
+    question: str
+
+
+class DeepResponse(BaseModel):
+    answer: str
+    thinking: str
+    sources: list[Source]
+    model: str
 
 
 def _get_client() -> OpenAI:
@@ -146,6 +173,103 @@ async def ask(request: AskRequest) -> AskResponse:
                 answer=msg.content or "",
                 sources=collected_sources,
             )
+
+
+@app.post("/deep", response_model=DeepResponse)
+async def deep(request: DeepRequest) -> DeepResponse:
+    """Deep IRAC analysis with Opus 4.7 + extended thinking.
+
+    Directly retrieves top-K relevant cases (no agentic loop), hands them to
+    Opus 4.7 with reasoning enabled, and returns answer + visible thinking.
+    """
+    client = _get_client()
+
+    try:
+        # Over-fetch chunks, then dedupe to ~8 unique cases for broader IRAC coverage.
+        raw_results = retrieve(query=request.question, n_results=24)
+    except Exception as e:
+        print(f"Retrieval error in /deep: {e}")
+        raw_results = []
+
+    seen_opinions: set[str] = set()
+    sources: list[Source] = []
+    excerpts: list[str] = []
+    for r in raw_results:
+        meta = r.get("metadata", {}) or {}
+        opinion_id = str(meta.get("opinion_id") or meta.get("source_url") or meta.get("case_name") or "")
+        if not opinion_id or opinion_id in seen_opinions:
+            continue
+        seen_opinions.add(opinion_id)
+
+        source = Source(
+            case_name=meta.get("case_name", "Unknown"),
+            court=meta.get("court", "Unknown"),
+            date_filed=meta.get("date_filed", ""),
+            source_url=meta.get("source_url", ""),
+        )
+        sources.append(source)
+        excerpts.append(
+            f"### {source.case_name} ({source.court}, {source.date_filed})\n"
+            f"{r['text'][:1500]}"
+        )
+        if len(sources) >= 8:
+            break
+
+    case_context = (
+        "\n\n".join(excerpts)
+        if excerpts
+        else "(No directly relevant cases found in the database.)"
+    )
+
+    user_content = (
+        f"**Question:** {request.question}\n\n"
+        f"**Relevant case law from the database:**\n\n{case_context}\n\n"
+        f"Now provide your IRAC analysis."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_DEEP,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_DEEP},
+                {"role": "user", "content": user_content},
+            ],
+            extra_body={"reasoning": {"max_tokens": THINKING_BUDGET}},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Opus call failed: {e}") from e
+
+    msg = response.choices[0].message
+    answer_text = msg.content or ""
+
+    # Defensive parsing — OpenRouter exposes reasoning under different fields
+    # depending on provider/model. Try the common shapes in priority order.
+    thinking_text = ""
+    reasoning_attr = getattr(msg, "reasoning", None)
+    if isinstance(reasoning_attr, str) and reasoning_attr.strip():
+        thinking_text = reasoning_attr
+    else:
+        details = getattr(msg, "reasoning_details", None)
+        if details:
+            parts = []
+            for block in details:
+                if isinstance(block, dict):
+                    text = block.get("text") or block.get("data") or ""
+                elif hasattr(block, "text"):
+                    text = getattr(block, "text", "") or ""
+                else:
+                    text = ""
+                if text:
+                    parts.append(str(text))
+            thinking_text = "\n\n".join(parts)
+
+    return DeepResponse(
+        answer=answer_text,
+        thinking=thinking_text,
+        sources=sources,
+        model=MODEL_DEEP,
+    )
 
 
 @app.post("/ingest")
