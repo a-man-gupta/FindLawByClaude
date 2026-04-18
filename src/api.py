@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -40,15 +41,21 @@ SYSTEM_PROMPT = (
 
 SYSTEM_PROMPT_DEEP = (
     "You are FindLawByClaude in Deep Analysis mode — a senior legal research assistant. "
-    "You have been provided with relevant case law retrieved from a database of US court opinions. "
-    "Perform a rigorous IRAC analysis:\n"
-    "  - **Issue**: What legal question is at stake?\n"
-    "  - **Rule**: What binding precedent or legal principle applies? Cite cases by name.\n"
-    "  - **Application**: How does the rule map to the fact pattern? Address evidence cutting both ways.\n"
-    "  - **Conclusion**: What is the most likely legal outcome, and with what confidence?\n\n"
-    "Use markdown headers (## Issue, ## Rule, ## Application, ## Conclusion). "
-    "Identify counterarguments and ambiguities — do not oversimplify. "
-    "End with a brief disclaimer that this is not legal advice."
+    "You have been provided with relevant case law retrieved from a database of US court opinions.\n\n"
+    "Your response MUST follow this exact two-part structure:\n\n"
+    "PART 1 — Reasoning (inside <thinking>...</thinking> tags):\n"
+    "Walk through your analysis step-by-step BEFORE writing the final answer. "
+    "Note the controlling doctrine, weigh how each retrieved case applies (or doesn't), "
+    "consider counterarguments, surface ambiguities, and explain WHY you reach each conclusion. "
+    "Be candid about uncertainty. This block should be substantive — at least 200 words.\n\n"
+    "PART 2 — Final IRAC analysis (after </thinking>):\n"
+    "Use markdown headers in this exact order:\n"
+    "  ## Issue — what legal question is at stake?\n"
+    "  ## Rule — what binding precedent applies? Cite cases by name.\n"
+    "  ## Application — how does the rule map to the fact pattern? Address evidence cutting both ways.\n"
+    "  ## Conclusion — most likely legal outcome and confidence level.\n\n"
+    "End with a one-line disclaimer that this is not legal advice. "
+    "Always include both parts in every response."
 )
 
 _ingest_lock = asyncio.Lock()
@@ -241,28 +248,45 @@ async def deep(request: DeepRequest) -> DeepResponse:
         raise HTTPException(status_code=502, detail=f"Opus call failed: {e}") from e
 
     msg = response.choices[0].message
-    answer_text = msg.content or ""
+    raw_text = msg.content or ""
 
-    # Defensive parsing — OpenRouter exposes reasoning under different fields
-    # depending on provider/model. Try the common shapes in priority order.
+    # Primary extraction: <thinking>...</thinking> tag in the response.
+    # We instruct the model to emit this in SYSTEM_PROMPT_DEEP — works regardless
+    # of provider-specific reasoning param support.
     thinking_text = ""
-    reasoning_attr = getattr(msg, "reasoning", None)
-    if isinstance(reasoning_attr, str) and reasoning_attr.strip():
-        thinking_text = reasoning_attr
-    else:
-        details = getattr(msg, "reasoning_details", None)
-        if details:
-            parts = []
-            for block in details:
-                if isinstance(block, dict):
-                    text = block.get("text") or block.get("data") or ""
-                elif hasattr(block, "text"):
-                    text = getattr(block, "text", "") or ""
-                else:
-                    text = ""
-                if text:
-                    parts.append(str(text))
-            thinking_text = "\n\n".join(parts)
+    answer_text = raw_text
+    tag_match = re.search(
+        r"<thinking>\s*(.*?)\s*</thinking>", raw_text, re.DOTALL | re.IGNORECASE
+    )
+    if tag_match:
+        thinking_text = tag_match.group(1).strip()
+        answer_text = re.sub(
+            r"<thinking>.*?</thinking>\s*",
+            "",
+            raw_text,
+            count=1,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    # Fallback: if no tag, check provider reasoning fields (some models populate these)
+    if not thinking_text:
+        reasoning_attr = getattr(msg, "reasoning", None)
+        if isinstance(reasoning_attr, str) and reasoning_attr.strip():
+            thinking_text = reasoning_attr
+        else:
+            details = getattr(msg, "reasoning_details", None)
+            if details:
+                parts = []
+                for block in details:
+                    if isinstance(block, dict):
+                        text = block.get("text") or block.get("data") or ""
+                    elif hasattr(block, "text"):
+                        text = getattr(block, "text", "") or ""
+                    else:
+                        text = ""
+                    if text:
+                        parts.append(str(text))
+                thinking_text = "\n\n".join(parts)
 
     return DeepResponse(
         answer=answer_text,
