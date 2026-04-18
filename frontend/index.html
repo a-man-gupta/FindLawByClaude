@@ -334,6 +334,110 @@
       font-family: 'Georgia', serif;
     }
     .suggestion-chip:hover { border-color: var(--gold); color: var(--gold-light); }
+
+    /* ── Deep Analysis ── */
+    .deep-btn {
+      margin-top: 10px;
+      align-self: flex-start;
+      background: transparent;
+      border: 1px solid var(--gold);
+      color: var(--gold);
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      font-family: 'Georgia', serif;
+      transition: background 0.2s, color 0.2s;
+    }
+    .deep-btn:hover:not(:disabled) { background: var(--gold); color: var(--navy); }
+    .deep-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .deep-result {
+      margin-top: 12px;
+      max-width: 820px;
+      align-self: flex-start;
+      width: 100%;
+    }
+
+    .deep-loading {
+      padding: 14px 18px;
+      color: var(--text-muted);
+      font-style: italic;
+      display: flex; gap: 10px; align-items: center;
+      background: var(--assistant-bubble);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      font-size: 14px;
+    }
+
+    .thinking-panel {
+      margin-bottom: 12px;
+      padding: 12px 16px;
+      background: var(--navy-light);
+      border-left: 3px solid var(--gold);
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .thinking-panel summary {
+      cursor: pointer;
+      color: var(--gold-light);
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      user-select: none;
+      list-style: none;
+      outline: none;
+    }
+    .thinking-panel summary::-webkit-details-marker { display: none; }
+    .thinking-panel summary::before { content: '▾ '; }
+    .thinking-panel:not([open]) summary::before { content: '▸ '; }
+    .thinking-panel pre {
+      margin-top: 10px;
+      font-family: 'Courier New', monospace;
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 12px;
+      line-height: 1.6;
+      max-height: 350px;
+      overflow-y: auto;
+      padding-right: 6px;
+    }
+
+    .deep-answer {
+      padding: 14px 18px;
+      background: var(--assistant-bubble);
+      border: 1px solid var(--gold);
+      border-radius: var(--radius);
+      line-height: 1.65;
+      font-size: 15px;
+    }
+    .deep-answer h2 { color: var(--gold); margin: 14px 0 6px; font-size: 1.05em; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+    .deep-answer h2:first-child { margin-top: 0; }
+    .deep-answer strong { color: var(--gold-light); }
+    .deep-answer ul, .deep-answer ol { padding-left: 20px; margin: 8px 0; }
+
+    .deep-model-badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      background: var(--navy);
+      border: 1px solid var(--gold);
+      border-radius: 10px;
+      font-size: 10px;
+      font-family: monospace;
+      color: var(--gold-light);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .deep-error {
+      padding: 12px 16px;
+      color: var(--red);
+      border: 1px solid var(--red);
+      border-radius: 8px;
+      font-size: 13px;
+      background: rgba(224, 85, 85, 0.08);
+    }
   </style>
 </head>
 <body>
@@ -552,10 +656,10 @@
 
         const data = await res.json();
         loadingEl.remove();
-        appendAssistantMessage(data.answer, data.sources || []);
+        appendAssistantMessage(data.answer, data.sources || [], question);
       } catch (err) {
         loadingEl.remove();
-        appendAssistantMessage(`**Error:** ${err.message}`, []);
+        appendAssistantMessage(`**Error:** ${err.message}`, [], question);
       } finally {
         sendBtn.disabled = false;
         input.focus();
@@ -588,7 +692,7 @@
       return wrapper;
     }
 
-    function appendAssistantMessage(text, sources) {
+    function appendAssistantMessage(text, sources, question) {
       const wrapper = document.createElement('div');
       wrapper.className = 'message assistant';
 
@@ -600,7 +704,7 @@
           <div class="source-item">
             <strong>${escapeHtml(s.case_name)}</strong>
             <span>${escapeHtml(s.court)}${s.date_filed ? ' · ' + escapeHtml(s.date_filed) : ''}</span>
-            ${s.source_url ? `<a href="${escapeHtml(s.source_url)}" target="_blank" rel="noopener">View on CourtListener →</a>` : ''}
+            ${s.source_url ? `<a href="${escapeHtml(s.source_url)}" target="_blank" rel="noopener">View source →</a>` : ''}
           </div>
         `).join('');
         sourcesHtml = `
@@ -616,8 +720,73 @@
         <div class="bubble">${rendered}</div>
         ${sourcesHtml}
       `;
+
+      if (question) {
+        const btn = document.createElement('button');
+        btn.className = 'deep-btn';
+        btn.innerHTML = '🧠 Deep Analysis (Opus 4.7)';
+        btn.onclick = () => runDeepAnalysis(question, btn);
+        wrapper.appendChild(btn);
+      }
+
       chatContainer.appendChild(wrapper);
       scrollToBottom();
+    }
+
+    async function runDeepAnalysis(question, btnEl) {
+      btnEl.disabled = true;
+      const container = document.createElement('div');
+      container.className = 'deep-result';
+      container.innerHTML = `
+        <div class="deep-loading">
+          <span class="spinner"></span>
+          Claude Opus is reasoning through the case law… (10–30 sec)
+        </div>
+      `;
+      btnEl.parentElement.replaceChild(container, btnEl);
+      scrollToBottom();
+
+      try {
+        const res = await fetch(`${API}/deep`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+
+        const modelShort = (data.model || '').split('/').pop() || 'opus';
+        const thinkingHtml = (data.thinking && data.thinking.trim())
+          ? `<details class="thinking-panel" open>
+               <summary>🧠 Claude's Reasoning <span class="deep-model-badge">${escapeHtml(modelShort)}</span></summary>
+               <pre>${escapeHtml(data.thinking)}</pre>
+             </details>`
+          : '';
+
+        const sourcesHtml = (data.sources || []).length > 0
+          ? `<div class="sources" style="margin-top:12px;">
+               <div class="sources-title">📚 Cases cited in analysis (${data.sources.length})</div>
+               ${data.sources.map(s => `
+                 <div class="source-item">
+                   <strong>${escapeHtml(s.case_name)}</strong>
+                   <span>${escapeHtml(s.court)}${s.date_filed ? ' · ' + escapeHtml(s.date_filed) : ''}</span>
+                   ${s.source_url ? `<a href="${escapeHtml(s.source_url)}" target="_blank" rel="noopener">View source →</a>` : ''}
+                 </div>`).join('')}
+             </div>`
+          : '';
+
+        container.innerHTML = `
+          ${thinkingHtml}
+          <div class="deep-answer">${marked.parse(data.answer || '')}</div>
+          ${sourcesHtml}
+        `;
+        scrollToBottom();
+      } catch (e) {
+        container.innerHTML = `<div class="deep-error">Deep analysis failed: ${escapeHtml(e.message)}</div>`;
+      }
     }
 
     function escapeHtml(str) {
