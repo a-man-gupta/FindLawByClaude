@@ -29,11 +29,16 @@ FindLawByClaude — help users discover, understand, and interact with legal inf
 5. `open frontend/index.html`    # or serve with any static file server
 
 ## API Endpoints
-- `POST /ask` — `{question}` → `{answer, sources[]}`
+- `POST /ask` — Fast chat. `{question}` → `{answer, sources[]}`. Uses Haiku 4.5 + tool-use loop.
+- `POST /deep` — Deep IRAC analysis. `{question}` → `{answer, thinking, sources[], model}`. Uses Opus 4.7 with extended thinking. **Slow (10–30s)** — show a spinner. The `thinking` field is the visible reasoning chain (render as collapsible block in UI).
 - `POST /ingest` — SSE stream of ingestion progress events
 - `GET  /ingest/status` — `{running: bool}`
 - `GET  /stats` — `{total_chunks: int}`
 - `GET  /health`
+
+## Models
+- `MODEL` (Haiku 4.5): fast chat for `/ask`
+- `MODEL_DEEP` (Opus 4.7): deep reasoning for `/deep`. Uses adaptive thinking — `THINKING_BUDGET=2500` is a hint, not a hard cap.
 
 ## Key Files
 - `src/ingest.py` — CourtListener fetch + ChromaDB upsert + CLI with tqdm

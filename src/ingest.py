@@ -152,67 +152,91 @@ def fetch_hf_us_opinions(topic: str, max_docs: int = 100) -> list[dict[str, Any]
 
 # ── Source: Oyez API (SCOTUS, completely free, no auth) ──────────────────────
 
-OYEZ_TERMS = [str(y) for y in range(2015, 2024)]  # ~9 terms of SCOTUS opinions
+# Strategic year sampling — captures landmark cases across major doctrinal eras.
+# Civil rights era, modern speech doctrine, fair use, privacy, recent SCOTUS.
+OYEZ_TERMS = [
+    "1953", "1962", "1963", "1965", "1966", "1967", "1968", "1969", "1971",
+    "1972", "1973", "1976", "1978", "1984", "1988", "1989", "1992", "1994",
+    "1997", "2000", "2003", "2010", "2014", "2015", "2017", "2018", "2019",
+    "2020", "2021", "2022", "2023",
+]
 
 
-async def fetch_oyez_cases(max_docs: int = 200) -> list[dict[str, Any]]:
-    """Fetch SCOTUS cases from Oyez API — free, no auth, rich opinion text."""
-    docs = []
+async def fetch_oyez_cases(max_docs: int = 300, per_term_cap: int = 12) -> list[dict[str, Any]]:
+    """Fetch SCOTUS cases from Oyez API — free, no auth, rich opinion text.
+
+    Phase 1: gather case lists across landmark terms in parallel.
+    Phase 2: fetch detail pages in parallel (with concurrency limit).
+    """
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        # Get case list across recent terms
-        for term in OYEZ_TERMS:
-            if len(docs) >= max_docs:
-                break
-            try:
-                resp = await client.get(
-                    "https://api.oyez.org/cases",
-                    params={"filter": f"term:{term}", "per_page": 100},
-                )
-                resp.raise_for_status()
-                cases = resp.json()
-            except Exception:
-                continue
+        list_sem = asyncio.Semaphore(8)
+        detail_sem = asyncio.Semaphore(20)
 
-            for case in cases:
-                if len(docs) >= max_docs:
-                    break
-                href = case.get("href", "")
-                if not href:
-                    continue
+        async def fetch_term_list(term: str) -> list[dict]:
+            async with list_sem:
+                try:
+                    resp = await client.get(
+                        "https://api.oyez.org/cases",
+                        params={"filter": f"term:{term}", "per_page": 100},
+                    )
+                    resp.raise_for_status()
+                    cases = resp.json()
+                    return cases[:per_term_cap]  # spread coverage across terms
+                except Exception:
+                    return []
+
+        term_results = await asyncio.gather(*(fetch_term_list(t) for t in OYEZ_TERMS))
+        all_case_metas: list[dict] = []
+        for cases in term_results:
+            all_case_metas.extend(cases)
+        all_case_metas = all_case_metas[:max_docs]
+
+        async def fetch_detail(case: dict) -> tuple[dict, dict | None]:
+            href = case.get("href", "")
+            if not href:
+                return case, None
+            async with detail_sem:
                 try:
                     detail_resp = await client.get(href)
                     detail_resp.raise_for_status()
-                    detail = detail_resp.json()
+                    return case, detail_resp.json()
                 except Exception:
-                    continue
+                    return case, None
 
-                # Combine all rich text fields into one document
-                parts = []
-                if detail.get("facts_of_the_case"):
-                    parts.append(f"FACTS: {re.sub(r'<[^>]+>', ' ', detail['facts_of_the_case'])}")
-                if detail.get("question"):
-                    parts.append(f"QUESTION: {re.sub(r'<[^>]+>', ' ', detail['question'])}")
-                if detail.get("conclusion"):
-                    parts.append(f"CONCLUSION: {re.sub(r'<[^>]+>', ' ', detail['conclusion'])}")
-                if detail.get("description"):
-                    parts.append(f"DESCRIPTION: {detail['description']}")
+        results = await asyncio.gather(*(fetch_detail(c) for c in all_case_metas))
 
-                text = re.sub(r"\s+", " ", " ".join(parts)).strip()
-                if len(text) < 100:
-                    continue
+    docs = []
+    for case_meta, detail in results:
+        if detail is None:
+            continue
 
-                citation = detail.get("citation") or {}
-                year = citation.get("year") or str(detail.get("term", ""))
-                docs.append(
-                    {
-                        "id": f"oyez_{detail.get('ID', hashlib.md5(href.encode()).hexdigest()[:8])}",
-                        "case_name": detail.get("name", case.get("name", "Unknown")),
-                        "court": "U.S. Supreme Court",
-                        "date_filed": year,
-                        "text": text,
-                        "source_url": detail.get("justia_url") or href,
-                    }
-                )
+        parts = []
+        if detail.get("facts_of_the_case"):
+            parts.append(f"FACTS: {re.sub(r'<[^>]+>', ' ', detail['facts_of_the_case'])}")
+        if detail.get("question"):
+            parts.append(f"QUESTION: {re.sub(r'<[^>]+>', ' ', detail['question'])}")
+        if detail.get("conclusion"):
+            parts.append(f"CONCLUSION: {re.sub(r'<[^>]+>', ' ', detail['conclusion'])}")
+        if detail.get("description"):
+            parts.append(f"DESCRIPTION: {detail['description']}")
+
+        text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        if len(text) < 100:
+            continue
+
+        citation = detail.get("citation") or {}
+        year = citation.get("year") or str(detail.get("term", ""))
+        href = case_meta.get("href", "")
+        docs.append(
+            {
+                "id": f"oyez_{detail.get('ID', hashlib.md5(href.encode()).hexdigest()[:8])}",
+                "case_name": detail.get("name", case_meta.get("name", "Unknown")),
+                "court": "U.S. Supreme Court",
+                "date_filed": year,
+                "text": text,
+                "source_url": detail.get("justia_url") or href,
+            }
+        )
 
     return docs
 
@@ -328,46 +352,55 @@ async def run_ingestion(queries: list[str] | None = None) -> AsyncIterator[dict[
     total_chunks = 0
     has_cl = bool(os.environ.get("COURTLISTENER_TOKEN"))
 
+    total_steps = 1 + (len(queries) if has_cl else 0)
+
     yield {
         "event": "start",
-        "total_queries": len(queries) + 1,  # +1 for bulk HF step
-        "sources": {"courtlistener": has_cl, "huggingface": True},
+        "total_queries": total_steps,
+        "sources": {"oyez": True, "courtlistener": has_cl},
     }
 
-    # Step 1: bulk ingest from HuggingFace (no auth)
-    yield {"event": "query_start", "query": "HuggingFace legal corpus", "index": 0, "total": len(queries) + 1}
+    # Step 1: Oyez SCOTUS landmark cases (PRIMARY — always run)
+    yield {"event": "query_start", "query": "Oyez SCOTUS landmark cases", "index": 0, "total": total_steps}
     try:
-        loop = asyncio.get_event_loop()
-        hf_docs = await loop.run_in_executor(None, fetch_hf_legal_cases, 500)
-        yield {"event": "fetched", "query": "HuggingFace legal corpus", "docs": len(hf_docs), "source": "HuggingFace"}
-        if hf_docs:
-            chunks = await loop.run_in_executor(None, ingest_to_chroma, hf_docs)
+        oyez_docs = await fetch_oyez_cases(max_docs=300)
+        yield {"event": "fetched", "query": "Oyez SCOTUS landmark cases", "docs": len(oyez_docs), "source": "Oyez"}
+        if oyez_docs:
+            loop = asyncio.get_event_loop()
+            chunks = await loop.run_in_executor(None, ingest_to_chroma, oyez_docs)
             total_chunks += chunks
-            yield {"event": "ingested", "query": "HuggingFace legal corpus", "chunks": chunks, "total_chunks": total_chunks}
+            yield {"event": "ingested", "query": "Oyez SCOTUS landmark cases", "chunks": chunks, "total_chunks": total_chunks}
+        else:
+            yield {"event": "skipped", "query": "Oyez SCOTUS landmark cases", "detail": "Oyez returned no documents"}
     except Exception as e:
-        yield {"event": "error", "query": "HuggingFace legal corpus", "detail": str(e)}
+        yield {"event": "error", "query": "Oyez SCOTUS landmark cases", "detail": str(e)}
 
-    # Step 2: per-query ingestion (CourtListener if available, else skip)
-    for i, query in enumerate(queries):
-        yield {"event": "query_start", "query": query, "index": i + 1, "total": len(queries) + 1}
-        docs: list[dict] = []
-
-        if has_cl:
+    # Step 2: per-query CourtListener supplementation (only if token available)
+    if has_cl:
+        for i, query in enumerate(queries):
+            yield {"event": "query_start", "query": query, "index": i + 1, "total": total_steps}
+            docs: list[dict] = []
             try:
                 docs = await fetch_courtlistener(query, num_results=50)
                 yield {"event": "fetched", "query": query, "docs": len(docs), "source": "CourtListener"}
             except Exception as e:
                 yield {"event": "warning", "query": query, "detail": str(e)}
 
-        if docs:
-            loop = asyncio.get_event_loop()
-            chunks = await loop.run_in_executor(None, ingest_to_chroma, docs)
-            total_chunks += chunks
-            yield {"event": "ingested", "query": query, "chunks": chunks, "total_chunks": total_chunks}
-        else:
-            yield {"event": "skipped", "query": query, "detail": "No CourtListener token — add COURTLISTENER_TOKEN to .env for more data"}
+            if docs:
+                loop = asyncio.get_event_loop()
+                chunks = await loop.run_in_executor(None, ingest_to_chroma, docs)
+                total_chunks += chunks
+                yield {"event": "ingested", "query": query, "chunks": chunks, "total_chunks": total_chunks}
+            else:
+                yield {"event": "skipped", "query": query, "detail": "No documents fetched"}
+    else:
+        yield {
+            "event": "info",
+            "query": "CourtListener",
+            "detail": "No COURTLISTENER_TOKEN set — Oyez-only ingestion. Add token to .env to expand corpus.",
+        }
 
-    yield {"event": "complete", "total_chunks": total_chunks, "total_queries": len(queries) + 1}
+    yield {"event": "complete", "total_chunks": total_chunks, "total_queries": total_steps}
 
 
 async def main() -> None:
