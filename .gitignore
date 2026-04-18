@@ -1,7 +1,53 @@
+# ── Secrets & environment ────────────────────────────────────────────────────
 .env
-venv/
-chroma_db/
+.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Vector DB / model cache ───────────────────────────────────────────────────
+chroma_db/
+*.sqlite3
+*.bin
+*.pkl
+*.pickle
+
+# ── HuggingFace & sentence-transformers cache ────────────────────────────────
+.cache/
+~/.cache/huggingface/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs & tmp ────────────────────────────────────────────────────────────────
+*.log
+tmp/
+temp/
